@@ -1,0 +1,591 @@
+---
+title: "HAI and Antimicrobial Use Point Prevalence Survey"
+subtitle: "Data quality and survey report (synthetic data)"
+output:
+  html_document:
+    theme: flatly
+    self_contained: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 4.4, dpi = 144)
+```
+
+```{r load}
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(ggplot2); library(ggrepel)
+  library(knitr); library(kableExtra); library(stringr); library(forcats)
+})
+res  <- readRDS("outputs/pps_results.rds")
+run  <- res$run; q <- res$query_log; dq <- res$dq_records; rules <- res$rules
+ind  <- res$indicators; core <- ind$core; p <- ind$params
+
+brand <- "#0f6b57"; ink <- "#16222e"; muted <- "#51606e"; flagc <- "#b3261e"
+theme_pps <- theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(colour = "#e3e8ec", linewidth = .4),
+        axis.title = element_text(colour = muted, size = 10),
+        axis.text = element_text(colour = ink), plot.title.position = "plot",
+        legend.position = "top", legend.title = element_blank())
+bars <- function(data, x, y, label = NULL, xlab = NULL) {
+  ggplot(data, aes({{ x }}, {{ y }})) +
+    geom_col(fill = brand, width = .62) +
+    geom_text(aes(label = {{ label }}), hjust = -0.15, size = 3.4, colour = ink) +
+    scale_x_continuous(expand = expansion(mult = c(0, .32))) +
+    labs(x = xlab, y = NULL) + theme_pps + theme(panel.grid.major.y = element_blank())
+}
+tbl <- function(x, ...) kbl(x, ...) %>% kable_styling(bootstrap_options = c("condensed", "hover"), full_width = FALSE, position = "left")
+pct <- function(n, d) {
+  d <- rep_len(d, length(n))   # vectorised over n even when d is a single denominator
+  ifelse(d > 0, sprintf("%.1f%%", 100 * n / d), "-")
+}
+npct <- function(n, d) sprintf("%d (%s)", n, pct(n, d))
+wilson <- function(x, n, z = 1.96) {
+  if (n == 0) return(c(NA, NA)); ph <- x / n
+  c((ph + z^2/(2*n) - z*sqrt(ph*(1-ph)/n + z^2/(4*n^2))) / (1 + z^2/n),
+    (ph + z^2/(2*n) + z*sqrt(ph*(1-ph)/n + z^2/(4*n^2))) / (1 + z^2/n)) * 100
+}
+ward_order <- c("Medical", "Surgical", "Paediatric", "Neonatal", "Intensive care", "Obstetrics and gynaecology")
+N <- nrow(core)
+# Ward as a factor; any code outside the codebook is shown as "(invalid code)"
+ward_factor <- function(w) {
+  w <- if_else(w %in% c(ward_order, "(missing)"), w, "(invalid code)")
+  factor(w, levels = c(ward_order, "(missing)", "(invalid code)"))
+}
+outlier_labels <- function(data, value, shown, unit = "") {
+  geom_text_repel(data = data,
+                  aes(label = paste0(record_id, if_else({{ value }} != {{ shown }}, paste0(" (", {{ value }}, unit, ")"), ""))),
+                  size = 3, colour = flagc, direction = "y", hjust = 0, nudge_x = .3,
+                  segment.size = .3, segment.colour = flagc, box.padding = .25,
+                  max.overlaps = Inf, min.segment.length = 0, seed = 1)
+}
+rev_pop <- filter(core, review_any)
+```
+
+```{css}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:14px 0 10px}
+.tile{border:1px solid #dfe6ec;border-radius:10px;padding:12px;text-align:center;background:#fff}
+.tile b{display:block;font-size:24px;color:#0f6b57;line-height:1.2}
+.tile span{font-size:13px;color:#51606e}
+.callout{background:#e9f4f0;border-radius:8px;padding:12px 16px;margin:12px 0}
+.defn{background:#f6f8fa;border-left:4px solid #0f6b57;padding:10px 14px;margin:10px 0;font-size:15px}
+.nav-pills>li>a{padding:6px 11px;font-size:14px}
+h3{margin-top:28px}
+```
+
+<div class="callout">
+**All data in this report is synthetic.** It was generated from scratch in the layout of a REDCap export for an HAI and antimicrobial use point prevalence survey: `r run$n_patients` patients in `r run$n_hospitals` invented hospitals, with data errors planted deliberately to demonstrate the quality checks. No real patient, facility or programme data was used. The HAI classification uses simplified definitions for demonstration (see the definitions on each page).
+</div>
+
+# {.tabset .tabset-pills}
+
+## 1. Data quality
+
+<div class="tiles">
+<div class="tile"><b>`r run$n_rows_received`</b><span>records exported (`r run$n_fields` fields)</span></div>
+<div class="tile"><b>`r run$n_rules`</b><span>validation rules applied</span></div>
+<div class="tile"><b>`r nrow(q)`</b><span>queries raised on `r n_distinct(q$record_id)` records</span></div>
+<div class="tile"><b>`r sum(q$severity == "Critical")`</b><span>critical queries</span></div>
+<div class="tile"><b>`r N`</b><span>records included in analysis (`r pct(N, run$n_records)`)</span></div>
+</div>
+
+Records with an open **critical** query (impossible value, unidentifiable or duplicated patient) are held back from the survey analysis on the following pages until the hospital resolves them. Records with major or minor queries stay in, flagged.
+
+### 1.1 Patient age, with outliers labelled by record ID
+
+```{r age-outliers, fig.height = 5.2}
+age_d <- dq %>% filter(!is.na(age)) %>%
+  group_by(ward) %>%
+  mutate(q1 = quantile(age, .25), q3 = quantile(age, .75), iqr = q3 - q1,
+         impossible = age < 0 | age > 110,
+         ward_implausible = (ward == "Neonatal" & age >= 1) | (ward == "Paediatric" & age >= 18),
+         tukey = age < q1 - 1.5 * iqr | age > q3 + 1.5 * iqr,
+         outlier = impossible | ward_implausible | tukey,
+         reason = case_when(impossible ~ "Impossible (outside 0 to 110)",
+                            ward_implausible ~ "Implausible for ward",
+                            tukey ~ "Statistical outlier for ward (1.5 x IQR)"),
+         shown = pmin(pmax(age, -5), 125)) %>% ungroup() %>%
+  mutate(ward = ward_factor(ward))
+ggplot(age_d, aes(ward, shown)) +
+  geom_boxplot(outlier.shape = NA, fill = "#e9f4f0", colour = muted, width = .55) +
+  geom_jitter(data = filter(age_d, !outlier), width = .18, height = 0, size = 1.1, colour = brand, alpha = .45) +
+  geom_point(data = filter(age_d, outlier), colour = flagc, size = 2.4) +
+  outlier_labels(filter(age_d, outlier), age, shown) +
+  geom_hline(yintercept = c(0, 110), linetype = "dashed", colour = "#9aa7b2") +
+  scale_y_continuous(breaks = seq(0, 120, 20)) +
+  labs(x = NULL, y = "Age (years)") + theme_pps +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1))
+```
+
+Red points are flagged, labelled with the record ID; values beyond the plotted range are shown at the edge with the actual value in brackets. Dashed lines mark the plausible range of 0 to 110 years.
+
+```{r age-table}
+age_d %>% filter(outlier) %>% arrange(reason, ward) %>%
+  transmute(`Record ID` = record_id, Hospital = site, Ward = ward, `Age (years)` = age, Reason = reason) %>% tbl()
+```
+
+### 1.2 Length of stay, with outliers labelled by record ID
+
+```{r los-outliers, fig.height = 5.2}
+los_d <- dq %>% filter(!is.na(los_days)) %>%
+  group_by(ward) %>%
+  mutate(q1 = quantile(los_days, .25), q3 = quantile(los_days, .75), iqr = q3 - q1,
+         negative = los_days < 0, over_year = los_days > 365,
+         extreme = los_days > q3 + 3 * iqr,
+         outlier = negative | over_year | extreme,
+         reason = case_when(negative ~ "Negative (admitted after survey date)",
+                            over_year ~ "Longer than 365 days",
+                            extreme ~ "Extreme for ward (above Q3 + 3 x IQR)"),
+         shown = pmin(los_days, 200)) %>% ungroup() %>%
+  mutate(ward = ward_factor(ward))
+ggplot(los_d, aes(ward, shown)) +
+  geom_boxplot(outlier.shape = NA, fill = "#e9f4f0", colour = muted, width = .55) +
+  geom_jitter(data = filter(los_d, !outlier), width = .18, height = 0, size = 1.1, colour = brand, alpha = .45) +
+  geom_point(data = filter(los_d, outlier), colour = flagc, size = 2.4) +
+  outlier_labels(filter(los_d, outlier), los_days, shown, " d") +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "#9aa7b2") +
+  labs(x = NULL, y = "Length of stay on survey date (days)") + theme_pps +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1))
+```
+
+Length of stay is the survey date minus the admission date. Statistical outliers on the long side are not errors in themselves; they are listed so the hospital can confirm the admission date.
+
+```{r los-table}
+los_d %>% filter(outlier) %>% arrange(reason, desc(los_days)) %>%
+  transmute(`Record ID` = record_id, Hospital = site, Ward = ward, `Length of stay (days)` = los_days, Reason = reason) %>% tbl()
+```
+
+### 1.3 Patients on the same ward with different survey dates
+
+Each ward should be surveyed on a single day. The table lists wards where some patients carry a different survey date from the rest of the ward.
+
+```{r ward-dates}
+wd <- dq %>% filter(ward != "(missing)", !is.na(survey_date)) %>%
+  group_by(site, ward) %>%
+  mutate(ward_date = ward_survey_date) %>%
+  filter(any(survey_date != ward_date)) %>%
+  summarise(`Ward survey date` = format(first(ward_date)),
+            `Patients on ward` = n(),
+            `Patients on another date` = sum(survey_date != ward_date),
+            `Other dates (record IDs)` = paste(sprintf("%s (%s)", format(survey_date[survey_date != ward_date]),
+                                                  record_id[survey_date != ward_date]), collapse = "; "),
+            .groups = "drop") %>%
+  rename(Hospital = site, Ward = ward)
+if (nrow(wd)) tbl(wd) else cat("No ward has patients surveyed on more than one date.")
+```
+
+### 1.4 Other quality issues
+
+```{r dq-rules, fig.height = 5}
+by_rule <- q %>% count(rule_id, severity) %>% left_join(select(rules, rule_id, description), by = "rule_id") %>%
+  arrange(desc(n))
+bars(by_rule, n, reorder(rule_id, n), n, "Queries raised")
+```
+
+```{r dq-rule-table}
+by_rule %>% transmute(Rule = rule_id, Severity = severity, Check = description, Queries = n) %>% tbl()
+```
+
+**Severity.** *Critical:* impossible or unidentifiable, so the record is held back. *Major:* missing or inconsistent, so it would bias an estimate. *Minor:* unusual but possible, so it only needs confirmation.
+
+```{r dq-site}
+per_site <- dq %>% count(site, name = "Records") %>%
+  left_join(count(q, site, name = "Queries"), by = "site") %>%
+  left_join(q %>% filter(severity == "Critical") %>% count(site, name = "Critical"), by = "site") %>%
+  mutate(across(c(Queries, Critical), ~ coalesce(.x, 0L)),
+         `Queries per 100 records` = sprintf("%.1f", 100 * Queries / Records)) %>%
+  arrange(desc(Queries / Records)) %>% rename(Hospital = site)
+tbl(per_site, caption = "Queries by hospital")
+q %>% count(data_collector, name = "Queries") %>%
+  left_join(count(dq, data_collector, name = "Records"), by = "data_collector") %>%
+  mutate(`Queries per 100 records` = sprintf("%.1f", 100 * Queries / Records)) %>%
+  arrange(desc(Queries / Records)) %>% head(6) %>%
+  rename(`Data collector` = data_collector) %>% tbl(caption = "Data collectors with the highest query rates")
+```
+
+The full query log, with a plain-language request to the hospital for every issue, is in `outputs/query_log.csv`, and one file per hospital in `outputs/query_logs_by_site/`.
+
+```{r dq-log}
+q %>% arrange(factor(severity, c("Critical", "Major", "Minor"))) %>% head(12) %>%
+  transmute(Query = query_id, Hospital = site, Record = record_id, Severity = severity, Rule = rule_id,
+            `Current value` = current_value, `Request to hospital` = query_text) %>%
+  tbl(caption = "Query log: first 12 queries by severity")
+```
+
+## 2. General survey report
+
+<div class="defn">
+**HAI chart review criteria** (set in `R/03_derive_indicators.R`):
+**Non-surgical:** receiving antimicrobials on the survey date **and** on hospital day `r p$min_los_review + 1` or later.
+**Surgical:** an operative procedure in the `r p$ssi_window_days` days before the survey date.
+A patient meeting either set of criteria undergoes HAI chart review.
+</div>
+
+<div class="tiles">
+<div class="tile"><b>`r N`</b><span>patients surveyed</span></div>
+<div class="tile"><b>`r npct(sum(core$on_amu), N)`</b><span>on antimicrobials</span></div>
+<div class="tile"><b>`r npct(sum(core$review_nonsurg), N)`</b><span>2.1 met non-surgical criteria</span></div>
+<div class="tile"><b>`r npct(sum(core$review_surg), N)`</b><span>2.2 met surgical criteria</span></div>
+<div class="tile"><b>`r npct(sum(core$review_any), N)`</b><span>2.3 total for HAI chart review</span></div>
+</div>
+
+```{r review-overlap}
+tibble(`Review group` = c("Non-surgical criteria only", "Surgical criteria only", "Both criteria",
+                          "Total for HAI chart review", "Not eligible for review"),
+       Patients = c(sum(core$review_nonsurg & !core$review_surg), sum(core$review_surg & !core$review_nonsurg),
+                    sum(core$review_nonsurg & core$review_surg), sum(core$review_any), sum(!core$review_any))) %>%
+  mutate(`% of surveyed` = pct(Patients, N)) %>% tbl()
+```
+
+```{r review-ward, fig.height = 3.8}
+rw <- core %>% group_by(ward) %>%
+  summarise(Patients = n(), `Non-surgical` = sum(review_nonsurg), Surgical = sum(review_surg),
+            `Total for review` = sum(review_any), .groups = "drop") %>%
+  mutate(pct_rev = 100 * `Total for review` / Patients, ward = factor(ward, ward_order))
+bars(rw, pct_rev, reorder(ward, pct_rev), sprintf("%.0f%% (%d of %d)", pct_rev, `Total for review`, Patients),
+     "% of patients undergoing HAI chart review")
+```
+
+```{r review-tables}
+rw %>% arrange(ward) %>% transmute(Ward = ward, Patients, `2.1 Non-surgical` = `Non-surgical`,
+                                   `2.2 Surgical` = Surgical, `2.3 Total for review` = `Total for review`,
+                                   `% reviewed` = sprintf("%.1f%%", pct_rev)) %>% tbl(caption = "By ward")
+core %>% group_by(Hospital = hospital) %>%
+  summarise(Patients = n(), `2.1 Non-surgical` = sum(review_nonsurg), `2.2 Surgical` = sum(review_surg),
+            `2.3 Total for review` = sum(review_any), .groups = "drop") %>%
+  mutate(`% reviewed` = pct(`2.3 Total for review`, Patients)) %>% tbl(caption = "By hospital")
+```
+
+## 3. Microbiology
+
+Culture results for all included patients, from specimens recorded in the survey. Positivity is shown per culture and per patient tested.
+
+```{r micro-fn}
+micro_block <- function(src_label) {
+  m <- ind$micro %>% filter(culture, source == src_label)
+  o <- ind$orgs %>% filter(source == src_label)
+  summ <- tibble(
+    Measure = c("Cultures performed", "Patients tested", "Positive cultures", "Culture positivity",
+                "Patients with a positive culture", "Patient positivity"),
+    Value = c(nrow(m), n_distinct(m$record_id), sum(m$positive), pct(sum(m$positive), nrow(m)),
+              n_distinct(m$record_id[m$positive]),
+              pct(n_distinct(m$record_id[m$positive]), n_distinct(m$record_id))))
+  orgt <- o %>% count(organism, sort = TRUE) %>% mutate(`% of isolates` = pct(n, sum(n))) %>%
+    rename(Organism = organism, Isolates = n)
+  list(summ = summ, orgt = orgt)
+}
+org_plot <- function(orgt) {
+  if (!nrow(orgt)) return(invisible())
+  print(bars(orgt, Isolates, reorder(Organism, Isolates), Isolates, "Isolates"))
+}
+```
+
+### 3.1 Blood cultures
+
+```{r micro-blood, fig.height = 3.4}
+b <- micro_block("Blood"); tbl(b$summ); org_plot(b$orgt); tbl(b$orgt, caption = "Organisms from blood cultures")
+```
+
+A single isolate of coagulase-negative staphylococci is usually a contaminant. It is counted here as a positive culture, but it does not meet the BSI definition on page 7.
+
+### 3.2 Urine cultures
+
+```{r micro-urine, fig.height = 3.2}
+u <- micro_block("Urine"); tbl(u$summ); org_plot(u$orgt); tbl(u$orgt, caption = "Organisms from urine cultures")
+```
+
+### 3.3 Respiratory cultures
+
+```{r micro-resp, fig.height = 2.8}
+r <- micro_block("Respiratory"); tbl(r$summ); org_plot(r$orgt); tbl(r$orgt, caption = "Organisms from respiratory cultures")
+```
+
+## 4. Devices
+
+```{r dev-setup}
+dev_levels <- c("Central line", "Urinary catheter", "Ventilator")
+amu_ids <- core$record_id[core$on_amu]
+n_amu <- length(amu_ids)
+```
+
+### 4.1 Devices present on the survey date among patients on antimicrobials
+
+```{r dev-41, fig.height = 2.8}
+d41 <- tibble(device = dev_levels) %>%
+  left_join(ind$devices %>% filter(present_on_survey, record_id %in% amu_ids) %>%
+              distinct(record_id, device) %>% count(device), by = "device") %>%
+  mutate(n = coalesce(n, 0L), pct_v = 100 * n / n_amu)
+any41 <- n_distinct(ind$devices$record_id[ind$devices$present_on_survey & ind$devices$record_id %in% amu_ids])
+bars(d41, pct_v, factor(device, rev(dev_levels)), sprintf("%.1f%% (%d)", pct_v, n), "% of patients on antimicrobials")
+tbl(bind_rows(d41 %>% transmute(Device = device, Patients = n, `% of patients on antimicrobials` = pct(n, n_amu)),
+              tibble(Device = "Any device", Patients = any41, `% of patients on antimicrobials` = pct(any41, n_amu))),
+    caption = sprintf("Denominator: %d patients on antimicrobials", n_amu))
+```
+
+### 4.2 Devices present in the `r p$window_days` days before the survey date
+
+```{r dev-42}
+d42 <- ind$devices %>% filter(in_14_days) %>% distinct(record_id, device)
+any42 <- n_distinct(d42$record_id)
+tibble(device = dev_levels) %>%
+  left_join(count(d42, device), by = "device") %>%
+  left_join(d42 %>% filter(record_id %in% amu_ids) %>% count(device, name = "n_on_amu"), by = "device") %>%
+  mutate(across(c(n, n_on_amu), ~ coalesce(.x, 0L))) %>%
+  transmute(Device = device, `All patients` = npct(n, N), `Patients on antimicrobials` = npct(n_on_amu, n_amu)) %>%
+  bind_rows(tibble(Device = "Any device", `All patients` = npct(any42, N),
+                   `Patients on antimicrobials` = npct(n_distinct(d42$record_id[d42$record_id %in% amu_ids]), n_amu))) %>%
+  tbl(caption = sprintf("A device counts if it was in place on any day from %d days before the survey date to the survey date", p$window_days))
+```
+
+### 4.3 Mean device duration
+
+```{r dev-43, fig.height = 2.8}
+d43 <- ind$devices %>% filter(duration_days > 0) %>% group_by(device) %>%
+  summarise(Episodes = n(), mean = mean(duration_days), sd = sd(duration_days),
+            median = median(duration_days), q1 = quantile(duration_days, .25), q3 = quantile(duration_days, .75),
+            min = min(duration_days), max = max(duration_days), .groups = "drop") %>%
+  mutate(device = factor(device, dev_levels))
+bars(d43, mean, factor(device, rev(dev_levels)), sprintf("%.1f days", mean), "Mean device duration (days)")
+d43 %>% arrange(device) %>% transmute(Device = device, Episodes, `Mean (days)` = sprintf("%.1f", mean),
+                                      SD = sprintf("%.1f", sd), `Median (IQR)` = sprintf("%.0f (%.0f to %.0f)", median, q1, q3),
+                                      Range = sprintf("%.0f to %.0f", min, max)) %>% tbl()
+```
+
+Duration runs from the insertion date to the removal date, or to the survey date if the device was still in place, counting both days.
+
+## 5. Antimicrobial and diagnostic metrics
+
+```{r amu-setup}
+rv_amu <- core %>% filter(review_any, on_amu)
+n5 <- nrow(rv_amu)
+a5 <- ind$amu %>% filter(record_id %in% rv_amu$record_id)
+```
+
+Patients who underwent HAI chart review **and** were receiving antimicrobials on the survey date: **`r n5`**.
+
+<div class="tiles">
+<div class="tile"><b>`r nrow(a5)`</b><span>antimicrobials prescribed</span></div>
+<div class="tile"><b>`r sprintf("%.2f", nrow(a5) / max(n5, 1))`</b><span>antimicrobials per patient</span></div>
+<div class="tile"><b>`r pct(sum(count(a5, record_id)$n >= 2), n5)`</b><span>patients on 2 or more</span></div>
+<div class="tile"><b>`r pct(sum(a5$route == "Parenteral"), nrow(a5))`</b><span>prescriptions parenteral</span></div>
+</div>
+
+```{r amu-tables}
+a5 %>% count(Agent = agent, sort = TRUE) %>% mutate(`% of prescriptions` = pct(n, sum(n))) %>%
+  rename(Prescriptions = n) %>% head(10) %>% tbl(caption = "Most prescribed antimicrobials")
+a5 %>% count(Indication = indication, sort = TRUE) %>% mutate(`% of prescriptions` = pct(n, sum(n))) %>%
+  rename(Prescriptions = n) %>% tbl(caption = "Indication")
+```
+
+### 5.1 Diagnostic test utilisation among patients on antimicrobials
+
+A test counts if the specimen was collected, or imaging done, in the review window (the `r p$window_days` days up to the survey date, or since admission if shorter).
+
+```{r diag}
+m5 <- ind$micro %>% filter(record_id %in% rv_amu$record_id, in_window)
+i5 <- ind$imaging %>% filter(record_id %in% rv_amu$record_id, in_window, chest)
+has <- function(ids) rv_amu$record_id %in% ids
+diag <- tibble(record_id = rv_amu$record_id,
+               blood = has(m5$record_id[m5$culture & m5$source == "Blood"]),
+               urine = has(m5$record_id[m5$culture & m5$source == "Urine"]),
+               resp  = has(m5$record_id[m5$culture & m5$source == "Respiratory"]),
+               imaging = has(i5$record_id)) %>%
+  mutate(any_culture = blood | urine | resp, any_test = any_culture | imaging)
+tibble(Measure = c("Any diagnostic test (culture or chest imaging)", "Any culture", "No diagnostic test"),
+       Patients = c(sum(diag$any_test), sum(diag$any_culture), sum(!diag$any_test))) %>%
+  mutate(`% of patients on antimicrobials` = pct(Patients, n5)) %>% tbl()
+```
+
+### 5.2 Utilisation by test type
+
+```{r diag-types, fig.height = 3}
+d52 <- tibble(Test = c("Blood culture", "Urine culture", "Respiratory culture", "Chest imaging"),
+              Patients = c(sum(diag$blood), sum(diag$urine), sum(diag$resp), sum(diag$imaging))) %>%
+  mutate(pct_v = 100 * Patients / n5)
+bars(d52, pct_v, reorder(Test, pct_v), sprintf("%.1f%% (%d)", pct_v, Patients), "% of reviewed patients on antimicrobials")
+d52 %>% transmute(Test, Patients, `% of patients on antimicrobials` = pct(Patients, n5)) %>% tbl()
+```
+
+```{r diag-indication}
+treat_ids <- a5 %>% filter(indication %in% c("Community-onset infection", "Hospital-onset infection")) %>% distinct(record_id)
+diag %>% mutate(group = if_else(record_id %in% treat_ids$record_id, "Treating an infection", "Prophylaxis, other or unknown only")) %>%
+  group_by(`Antimicrobial purpose` = group) %>%
+  summarise(Patients = n(), `Any culture` = pct(sum(any_culture), n()), `Blood culture` = pct(sum(blood), n()),
+            `Chest imaging` = pct(sum(imaging), n()), .groups = "drop") %>%
+  tbl(caption = "Culture use by purpose of antimicrobial therapy")
+```
+
+```{r hai-page-fn}
+hai_page <- function(type, label, signs = NULL) {
+  rv <- core %>% filter(.data[[paste0("reviewed_", type)]])
+  h  <- sum(rv[[paste0("hai_", type)]])
+  tibble(Measure = c("Patients reviewed", "Met the HAI definition",
+                     if (type != "ssi") "Infection present on admission (not an HAI)",
+                     "Did not meet the definition"),
+         Patients = c(nrow(rv), h, if (type != "ssi") sum(rv[[paste0("poa_", type)]]),
+                      nrow(rv) - h - if (type != "ssi") sum(rv[[paste0("poa_", type)]]) else 0)) %>%
+    mutate(`% of reviewed` = pct(Patients, nrow(rv)))
+}
+by_ward_type <- function(type) {
+  core %>% group_by(Ward = factor(ward, ward_order)) %>%
+    summarise(Surveyed = n(), Reviewed = sum(.data[[paste0("reviewed_", type)]]),
+              HAI = sum(.data[[paste0("hai_", type)]]), .groups = "drop") %>%
+    mutate(`HAI per 100 surveyed` = sprintf("%.1f", 100 * HAI / Surveyed)) %>% arrange(Ward)
+}
+sym_table <- function(type, fields, labels) {
+  rv <- core %>% filter(.data[[paste0("reviewed_", type)]], .data[[paste0("hai_", type)]])
+  src <- res$forms %>% filter(record_id %in% rv$record_id)
+  tibble(`Sign or symptom` = labels,
+         Patients = vapply(fields, function(f) sum(src[[f]] == "1", na.rm = TRUE), 0L)) %>%
+    mutate(`% of HAI cases` = pct(Patients, nrow(rv)))
+}
+hai_orgs <- function(type, src_label) {
+  ids <- core$record_id[core[[paste0("hai_", type)]]]
+  ind$orgs %>% filter(record_id %in% ids, source == src_label) %>% count(Organism = organism, sort = TRUE) %>%
+    rename(Isolates = n)
+}
+```
+
+## 6. UTI
+
+<div class="defn">
+**Reviewed for UTI:** under HAI chart review (non-surgical criteria) with a urine culture, urinalysis, urinary catheter or clinician-documented UTI, so the UTI classification form was completed.
+**Meets the UTI definition (simplified):** positive urine culture (not *Candida* only) in the review window, at least one UTI sign or symptom not present on admission, and onset on hospital day `r p$hai_min_day` or later. **Catheter-associated (CAUTI):** urinary catheter in place for more than `r p$device_min_days` days on the date of event.
+</div>
+
+```{r uti}
+tbl(hai_page("uti"))
+sym_table("uti", paste0(c("fever_uti", "urgency", "frequency", "dysuria", "tenderness", "suprapubicpain", "flankpain"), "_reviewdate"),
+          c("Fever", "Urgency", "Frequency", "Dysuria", "Costovertebral tenderness", "Suprapubic pain", "Flank pain")) %>%
+  tbl(caption = "Signs and symptoms among patients meeting the UTI definition")
+tibble(Measure = "Catheter-associated UTI (CAUTI)", Patients = sum(core$cauti),
+       `% of UTI` = pct(sum(core$cauti), sum(core$hai_uti))) %>% tbl()
+tbl(hai_orgs("uti", "Urine"), caption = "Organisms causing UTI")
+tbl(by_ward_type("uti"), caption = "By ward")
+```
+
+## 7. BSI
+
+<div class="defn">
+**Reviewed for BSI:** under HAI chart review (non-surgical criteria) with a blood culture in the review window, so the BSI classification form was completed.
+**Meets the BSI definition (simplified):** blood culture positive for a recognised pathogen in the review window (a single coagulase-negative staphylococcus is treated as a contaminant), not present on admission, onset on hospital day `r p$hai_min_day` or later. **Central line-associated (CLABSI):** central line in place for more than `r p$device_min_days` days on the date of event.
+</div>
+
+```{r bsi}
+tbl(hai_page("bsi"))
+sym_table("bsi", paste0(c("fever_bsi", "chills", "hypotension"), "_reviewdate"), c("Fever", "Chills", "Hypotension")) %>%
+  tbl(caption = "Signs among patients meeting the BSI definition")
+tibble(Measure = "Central line-associated BSI (CLABSI)", Patients = sum(core$clabsi),
+       `% of BSI` = pct(sum(core$clabsi), sum(core$hai_bsi))) %>% tbl()
+tbl(hai_orgs("bsi", "Blood"), caption = "Organisms causing BSI")
+tbl(by_ward_type("bsi"), caption = "By ward")
+```
+
+## 8. Pneumonia
+
+<div class="defn">
+**Reviewed for pneumonia:** under HAI chart review (non-surgical criteria) with chest imaging, a respiratory culture or clinician-documented pneumonia, so the pneumonia classification form was completed.
+**Meets the pneumonia definition (simplified):** chest imaging consistent with pneumonia in the review window, fever plus at least one respiratory sign or symptom, not present on admission, onset on hospital day `r p$hai_min_day` or later. **Ventilator-associated (VAP):** ventilator in place for more than `r p$device_min_days` days on the date of event.
+</div>
+
+```{r pn}
+tbl(hai_page("pn"))
+sym_table("pn", c("fever_pn_reviewdate", "cough_pn_reviewdate", "sputum_pn_reviewdate", "auscultation_reviewdate",
+                  "gas_pn_reviewdate", "tachypnea_reviewdate", "dyspnea_reviewdate"),
+          c("Fever", "Cough", "New or changed sputum", "Abnormal auscultation", "Worsening gas exchange", "Tachypnoea", "Dyspnoea")) %>%
+  tbl(caption = "Signs and symptoms among patients meeting the pneumonia definition")
+tibble(Measure = "Ventilator-associated pneumonia (VAP)", Patients = sum(core$vap),
+       `% of pneumonia` = pct(sum(core$vap), sum(core$hai_pn))) %>% tbl()
+pn_cult <- ind$micro %>% filter(record_id %in% core$record_id[core$hai_pn], source == "Respiratory", culture)
+```
+
+A respiratory culture was done for `r npct(n_distinct(pn_cult$record_id), sum(core$hai_pn))` of patients meeting the pneumonia definition.
+
+```{r pn-orgs}
+tbl(hai_orgs("pn", "Respiratory"), caption = "Organisms from respiratory cultures in pneumonia cases")
+tbl(by_ward_type("pn"), caption = "By ward")
+```
+
+## 9. SSI
+
+<div class="defn">
+**Reviewed for SSI:** met the surgical criteria (an operative procedure in the `r p$ssi_window_days` days before the survey date), so the SSI form was completed.
+**Meets the SSI definition (simplified):** SSI diagnosed within `r p$ssi_window_days` days after the procedure, with purulent drainage, an abscess, or a deliberately opened incision with fever, pain or swelling.
+</div>
+
+```{r ssi}
+tbl(hai_page("ssi"))
+ssi_src <- res$forms %>% filter(record_id %in% core$record_id[core$hai_ssi])
+tibble(`Sign` = c("Purulent drainage", "Abscess", "Incision deliberately opened", "Fever", "Localised pain", "Swelling"),
+       Patients = vapply(c("drainage_ssi", "abscess_ssi", "incision_ssi", "fever_ssi", "pain_ssi", "swelling_ssi"),
+                         function(f) sum(ssi_src[[f]] == "1", na.rm = TRUE), 0L)) %>%
+  mutate(`% of SSI cases` = pct(Patients, nrow(ssi_src))) %>% tbl(caption = "Signs among patients meeting the SSI definition")
+ssi_src %>% count(Depth = c("1" = "Superficial incisional", "2" = "Deep incisional", "3" = "Organ or space")[ssi_block_wound_diagnosis]) %>%
+  rename(Patients = n) %>% tbl(caption = "SSI depth")
+tbl(hai_orgs("ssi", "Wound or surgical site"), caption = "Organisms from wound cultures in SSI cases")
+tbl(by_ward_type("ssi"), caption = "By ward")
+```
+
+## 10. HAI summary
+
+```{r hai-summary}
+n_hai <- sum(core$any_hai); ci <- wilson(n_hai, N)
+n_rv <- sum(core$review_any); ci_rv <- wilson(n_hai, n_rv)
+```
+
+<div class="tiles">
+<div class="tile"><b>`r n_hai`</b><span>patients with at least one HAI</span></div>
+<div class="tile"><b>`r sprintf("%.1f%%", 100 * n_hai / N)`</b><span>HAI prevalence among all surveyed (95% CI `r sprintf("%.1f to %.1f", ci[1], ci[2])`)</span></div>
+<div class="tile"><b>`r sprintf("%.1f%%", 100 * n_hai / n_rv)`</b><span>among patients reviewed (95% CI `r sprintf("%.1f to %.1f", ci_rv[1], ci_rv[2])`)</span></div>
+<div class="tile"><b>`r sum(core$n_hai)`</b><span>HAI events</span></div>
+<div class="tile"><b>`r sum(core$cauti) + sum(core$clabsi) + sum(core$vap)`</b><span>device-associated HAIs</span></div>
+</div>
+
+```{r hai-types, fig.height = 3}
+ht <- tibble(Type = c("Urinary tract infection", "Bloodstream infection", "Pneumonia", "Surgical site infection"),
+             code = c("uti", "bsi", "pn", "ssi"),
+             Events = c(sum(core$hai_uti), sum(core$hai_bsi), sum(core$hai_pn), sum(core$hai_ssi)),
+             `Device-associated` = c(sum(core$cauti), sum(core$clabsi), sum(core$vap), NA)) %>%
+  mutate(share = 100 * Events / sum(Events))
+bars(ht, Events, reorder(Type, Events), sprintf("%d (%.0f%%)", Events, share), "HAI events")
+ht %>% transmute(`HAI type` = Type, Events, `% of HAI events` = sprintf("%.1f%%", share),
+                 `Prevalence per 100 surveyed` = sprintf("%.1f", 100 * Events / N),
+                 `Device-associated` = if_else(is.na(`Device-associated`), "Not applicable", as.character(`Device-associated`))) %>% tbl()
+```
+
+```{r hai-ward}
+hw <- core %>% group_by(Ward = factor(ward, ward_order)) %>%
+  summarise(Surveyed = n(), `With HAI` = sum(any_hai), UTI = sum(hai_uti), BSI = sum(hai_bsi),
+            Pneumonia = sum(hai_pn), SSI = sum(hai_ssi), .groups = "drop") %>% arrange(Ward) %>%
+  mutate(prev = 100 * `With HAI` / Surveyed)
+bars(hw, prev, reorder(Ward, prev), sprintf("%.1f%%", prev), "% of patients with at least one HAI")
+hw %>% mutate(`HAI prevalence` = sprintf("%.1f%%", prev)) %>% select(-prev) %>% tbl(caption = "By ward")
+core %>% group_by(Hospital = hospital) %>%
+  summarise(Surveyed = n(), `With HAI` = sum(any_hai), .groups = "drop") %>%
+  rowwise() %>% mutate(ci = list(wilson(`With HAI`, Surveyed)),
+                       `HAI prevalence (95% CI)` = sprintf("%.1f%% (%.1f to %.1f)", 100 * `With HAI` / Surveyed, ci[1], ci[2])) %>%
+  ungroup() %>% select(-ci) %>% tbl(caption = "By hospital")
+```
+
+```{r hai-orgs, fig.height = 3.6}
+hai_ids <- list(uti = "Urine", bsi = "Blood", pn = "Respiratory", ssi = "Wound or surgical site")
+ho <- purrr::imap_dfr(hai_ids, function(src, type) {
+  ind$orgs %>% filter(record_id %in% core$record_id[core[[paste0("hai_", type)]]], source == src)
+}) %>% count(Organism = organism, sort = TRUE)
+bars(ho, n, reorder(Organism, n), n, "Isolates from HAI cases")
+```
+
+```{r impression}
+imp <- tibble(Type = c("UTI", "BSI", "Pneumonia", "SSI"),
+              hai = list(core$hai_uti, core$hai_bsi, core$hai_pn, core$hai_ssi),
+              imp = list(core$impression_uti, core$impression_bsi, core$impression_pn, core$impression_ssi)) %>%
+  rowwise() %>%
+  transmute(`HAI type` = Type, `Met definition` = sum(hai),
+            `Documented by clinician` = sum(hai & imp),
+            `% documented` = pct(sum(hai & imp), sum(hai))) %>% ungroup()
+tbl(imp, caption = "How many surveillance-defined HAIs the clinical team had documented")
+```
+
+Infections that meet the surveillance definition but are not documented by the clinical team point to under-recognition, and are a useful prompt for feedback to the ward.
